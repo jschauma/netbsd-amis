@@ -24,9 +24,7 @@ _FETCH="no"
 _FORCE_FETCH="no"
 _VERIFY="gpg -q --verify"
 _NETBSD_URL="https://cdn.netbsd.org/pub/NetBSD/"
-_NETBSD_HASHES="${_NETBSD_URL}/security/hashes/NetBSD-${RELEASE}_hashes.asc"
 _SETS_DIR="amd64/binary/sets"
-_NETBSD_SITE="${_NETBSD_URL}/NetBSD-${RELEASE}/${_SETS_DIR}/"
 _CVSWEB_URL="http://cvsweb.netbsd.org/bsdweb.cgi/%7echeckout%7e/src/distrib/utils/embedded/files"
 _CVSWEB_FILES="ec2_init resize_disklabel resize_gpt"
 
@@ -115,24 +113,24 @@ fetchFiles() {
 	(
 	cd ${BUILDDIR}
 	if [ -n "${_VERIFY}" ]; then
-		if [ ! -f "${_NETBSD_HASHES##*/}" ]; then
-			verbose "Fetching signed hashes from ${_NETBSD_HASHES}..." 2
-			ftp -V ${_NETBSD_HASHES}
+		if [ ! -f "${NETBSD_HASHES##*/}" ]; then
+			verbose "Fetching signed hashes from ${NETBSD_HASHES}..." 2
+			ftp -V ${NETBSD_HASHES}
 		fi
 
 		verbose "Verifying signature file..." 2
-		run "${_VERIFY} ${_NETBSD_HASHES##*/} >/dev/null 2>&1" "wait"
+		run "${_VERIFY} ${NETBSD_HASHES##*/} >/dev/null 2>&1" "wait"
 	fi
 
 	for f in ${_SETS}; do
 		if [ ! -f ${f} ] || [ x"${_FORCE_FETCH}" = x"yes" ]; then
 			verbose "Fetching ${f}..." 2
-			ftp -V ${_NETBSD_SITE}/${f}
+			ftp -V ${NETBSD_SITE}/${f}
 		fi
 		if [ -n "${_VERIFY}" ]; then
 			verbose "Verifying checksum for ${f}..." 3 "wait"
-			sum1=$(sed -n -e "s|^SHA512 (NetBSD-${RELEASE}/${_SETS_DIR}/${f}) = \(.*\)|\1|p" ${_NETBSD_HASHES##*/})
-			sum2=$(sha512 ${f} | awk '{print $NF}')
+			sum1=$(sed -n -e "s|^SHA512 (NetBSD-${RELEASE}/${_SETS_DIR}/${f}) = \(.*\)|\1|p" ${NETBSD_HASHES##*/})
+			sum2=$(openssl sha512 ${f} | awk '{print $NF}')
 			if [ x"${sum1}" != x"${sum2}" ]; then
 				echo "Checksum mismatch for ${f}!" >&2
 				exit 1
@@ -361,6 +359,8 @@ done
 checkDir
 
 BUILDDIR=$(cd ${BUILDDIR} && pwd)
+NETBSD_HASHES="${_NETBSD_URL}/security/hashes/NetBSD-${RELEASE}_hashes.asc"
+NETBSD_SITE="${_NETBSD_URL}/NetBSD-${RELEASE}/${_SETS_DIR}/"
 
 if [ x"${_FETCH}" = x"yes" -o x"${_FORCE_FETCH}" = x"yes" ]; then
 	fetchFiles
