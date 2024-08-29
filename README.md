@@ -7,8 +7,6 @@ of AWS AMIs for [NetBSD](https://www.netbsd.org).
 * [build-amd64](https://github.com/jschauma/netbsd-amis/blob/main/build-amd64)
   -- a shell script to build a disk image of NetBSD/amd64 10.0 suitable for
   AMI creation
-* [amd64.img.xz](https://github.com/jschauma/netbsd-amis/blob/main/amd64.img.xz)
-  -- a compressed disk image of NetBSD/amd64 10.0
 
 See also
 --------
