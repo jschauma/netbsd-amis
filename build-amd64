@@ -1,0 +1,376 @@
+#! /bin/sh
+#
+# Originally written by Jan Schaumann
+# <jschauma@netmeister.org> in August 2024.
+#
+# This script can be used to create a NetBSD/amd64
+# image suitable to run in a VM or to create an AWS
+# AMI from.
+#
+# This script is in the public domain.
+
+set -eu
+umask 077
+
+PROGNAME="${0##*/}"
+RELEASE="10.0"
+VERBOSITY=0
+BUILDDIR="./nbamd64"
+SETSDIR="./sets"
+IMG="${BUILDDIR}/amd64.img"
+
+_DK=""
+_FETCH="no"
+_FORCE_FETCH="no"
+_VERIFY="gpg -q --verify"
+_NETBSD_URL="https://cdn.netbsd.org/pub/NetBSD/"
+_NETBSD_HASHES="${_NETBSD_URL}/security/hashes/NetBSD-${RELEASE}_hashes.asc"
+_SETS_DIR="amd64/binary/sets"
+_NETBSD_SITE="${_NETBSD_URL}/NetBSD-${RELEASE}/${_SETS_DIR}/"
+_CVSWEB_URL="http://cvsweb.netbsd.org/bsdweb.cgi/%7echeckout%7e/src/distrib/utils/embedded/files"
+_CVSWEB_FILES="ec2_init resize_disklabel resize_gpt"
+
+_SETS="base.tar.xz
+	comp.tar.xz
+	etc.tar.xz
+	games.tar.xz
+	man.tar.xz
+	misc.tar.xz
+	modules.tar.xz
+	rescue.tar.xz
+	text.tar.xz
+	kern-GENERIC.tar.xz"
+
+_SUDO=""
+if [ x"$(id -u)" != x"0" ]; then
+	_SUDO="$(which sudo || echo 'nosudo') "
+	if [ x"${_SUDO}" = x"nosudo " ]; then
+		echo "Please run this script as root or install sudo(1)." >&2
+		exit 1
+	fi
+fi
+
+if [ x"$(uname)" != x"NetBSD" ]; then
+	echo "Sorry, this script is only intended to run on NetBSD." >&2
+	exit 1
+fi
+
+###
+### Functions
+###
+
+checkDir() {
+	verbose "Checking for NetBSD sets in ${BUILDDIR}..."
+
+	if [ ! -d "${BUILDDIR}" ]; then
+		verbose "No such directory.  Creating ${BUILDDIR}..."
+		mkdir -p ${BUILDDIR}
+	fi
+
+	if [ ! -f "${SETSDIR}/base.tar.xz" ]; then
+		verbose "No NetBSD sets found in ${SETSDIR}.  Fetching sets into ${BUILDDIR}."
+		SETSDIR="${BUILDDIR}"
+		_FETCH="yes"
+	fi
+}
+
+cleanup() {
+	verbose "Cleaning up..."
+
+	verbose "Unconfiguring vnode disk..." 2
+	run "${_SUDO}vndconfig -u vnd0"
+}
+
+configureDisk() {
+	verbose "Creating new disk image ${IMG}..."
+	run "dd if=/dev/zero of=${IMG} msgfmt=quiet bs=102400000 count=15" "wait"
+
+	verbose "Configuring vnode disk and partitioning..." 2
+	run "${_SUDO}vndconfig vnd0 ${IMG}"
+	run "${_SUDO}gpt create vnd0"
+	run "${_SUDO}gpt -q add -t swap -l netbsd-swap -s 256m vnd0"
+	run "${_SUDO}gpt -q add -t ffs -l netbsd-root vnd0"
+
+	verbose "Marking GPT partition active active..." 2
+
+	if [ ! -f ${BUILDDIR}/usr/mdec/gptmbr.bin ]; then
+		run "tar zxf ${SETSDIR}/base.tar.xz -C ${BUILDDIR} ./usr/mdec/gptmbr.bin" "wait"
+	fi
+	run "${_SUDO}gpt -q biosboot -c ${BUILDDIR}/usr/mdec/gptmbr.bin -A -L netbsd-root vnd0"
+}
+
+fetchCVSFile() {
+	local f="${1}"
+	if [ ! -f ${f} ] || [ x"${_FORCE_FETCH}" = x"yes" ]; then
+		verbose "Fetching ${f}..." 2
+		ftp -V -o "${BUILDDIR}/${f}" "${_CVSWEB_URL}/${f}"
+	fi
+}
+
+fetchFiles() {
+	local sum1 sum2
+
+	verbose "Fetching NetBSD/amd64 ${RELEASE} sets from ${_NETBSD_URL}..."
+
+	(
+	cd ${BUILDDIR}
+	if [ -n "${_VERIFY}" ]; then
+		if [ ! -f "${_NETBSD_HASHES##*/}" ]; then
+			verbose "Fetching signed hashes from ${_NETBSD_HASHES}..." 2
+			ftp -V ${_NETBSD_HASHES}
+		fi
+
+		verbose "Verifying signature file..." 2
+		run "${_VERIFY} ${_NETBSD_HASHES##*/} >/dev/null 2>&1" "wait"
+	fi
+
+	for f in ${_SETS}; do
+		if [ ! -f ${f} ] || [ x"${_FORCE_FETCH}" = x"yes" ]; then
+			verbose "Fetching ${f}..." 2
+			ftp -V ${_NETBSD_SITE}/${f}
+		fi
+		if [ -n "${_VERIFY}" ]; then
+			verbose "Verifying checksum for ${f}..." 3 "wait"
+			sum1=$(sed -n -e "s|^SHA512 (NetBSD-${RELEASE}/${_SETS_DIR}/${f}) = \(.*\)|\1|p" ${_NETBSD_HASHES##*/})
+			sum2=$(sha512 ${f} | awk '{print $NF}')
+			if [ x"${sum1}" != x"${sum2}" ]; then
+				echo "Checksum mismatch for ${f}!" >&2
+				exit 1
+			fi
+			verbose " ok." 3 "" "true"
+		fi
+	done
+
+	for f in ${_CVSWEB_FILES}; do
+		fetchCVSFile ${f}
+	done
+	)
+}
+
+installNetBSD() {
+	local cmd
+
+	verbose "Installing NetBSD into ${BUILDDIR}/mnt..."
+	run "mkdir -p ${BUILDDIR}/mnt"
+
+	_DK=$(${_SUDO}dkctl vnd0 listwedges | sed -n -e 's/^\(.*\): netbsd-root.*/\1/p')
+	run "${_SUDO}newfs -V 0 -O2 /dev/r${_DK}"
+
+	run "${_SUDO}mount /dev/${_DK} ${BUILDDIR}/mnt"
+
+	for f in ${_SETS}; do
+		verbose "Extracting ${f}..." 2
+		cmd="progress -zf ${SETSDIR}/${f} tar zxpf - -C ${BUILDDIR}/mnt"
+		if [ ${VERBOSITY} -lt 2 ]; then
+			cmd="tar zxpf ${SETSDIR}/${f} -C ${BUILDDIR}/mnt"
+		fi
+		run "${_SUDO}${cmd}"
+	done
+
+	verbose "Installing additional files..." 2
+	run "${_SUDO}install -c -m 444 ${BUILDDIR}/mnt/usr/mdec/boot ${BUILDDIR}/mnt/boot"
+	run "${_SUDO}mkdir ${BUILDDIR}/mnt/proc"
+
+	for f in ${_CVSWEB_FILES}; do
+		fetchCVSFile ${f}
+		run "${_SUDO}install -c -m 555 ${BUILDDIR}/${f} ${BUILDDIR}/mnt/etc/rc.d/${f}"
+	done
+
+	verbose "Creating /etc/fstab..." 2
+	cat >${BUILDDIR}/fstab <<EOF
+# NetBSD /etc/fstab
+# See /usr/share/examples/fstab/ for more examples.
+NAME=netbsd-root	/	ffs	rw,noatime	1 1
+NAME=netbsd-swap	none	swap	sw	0 0
+ptyfs		/dev/pts	ptyfs	rw
+procfs		/proc		procfs	rw
+tmpfs		/var/shm	tmpfs rw,-m1777,-sram%25
+EOF
+
+	run "${_SUDO}cp ${BUILDDIR}/fstab ${BUILDDIR}/mnt/etc/fstab"
+
+	verbose "Creating /etc/rc.conf..." 2
+	cat >${BUILDDIR}/rc.conf <<"EOF"
+# See rc.conf(5) for more information.
+#
+# Use program=YES to enable program, NO to disable it.
+# program_flags are passed to the program on the command line.
+#
+
+# Load the defaults in from /etc/defaults/rc.conf (if
+# it's readable).
+# These can be overridden below.
+#
+if [ -r /etc/defaults/rc.conf ]; then
+	. /etc/defaults/rc.conf
+fi
+
+dev_exists() {
+	if /sbin/drvctl -l $1 >/dev/null 2>&1 ; then
+		printf YES
+	else
+		printf NO
+	fi
+}
+
+is_cloud() {
+	ret=NO
+
+	# AWS EC2
+	if [ "$(dev_exists ena0)" = "YES" ]; then
+		ret=YES
+	fi
+
+	# Oracle OCI
+	case "$(/sbin/sysctl -n machdep.dmi.chassis-asset-tag 2>/dev/null)" in
+	OracleCloud*)
+		ret=YES
+		;;
+	esac
+
+	printf $ret
+}
+
+rc_configured=YES
+hostname=amd64
+savecore=NO
+sshd=YES
+ntpd=YES
+ntpd_flags="-g"
+certctl_init=YES
+resize_gpt=YES
+resize_root=YES
+resize_root_flags="-p"
+resize_root_postcmd="/sbin/reboot -n"
+mdnsd=YES
+devpubd=YES
+wscons=$(dev_exists wsdisplay0)
+ec2_init=$(is_cloud)
+random_seed=YES
+dhcpcd=YES
+if checkyesno ec2_init ; then
+	dhcpcd_flags="$dhcpcd_flags -w"
+else
+	dhcpcd_flags="$dhcpcd_flags -b"
+fi
+EOF
+
+	run "${_SUDO}cp ${BUILDDIR}/rc.conf ${BUILDDIR}/mnt/etc/rc.conf"
+
+	verbose "Creating device nodes..." 2
+	(
+	cd ${BUILDDIR}/mnt/dev
+	run "${_SUDO}./MAKEDEV all" "wait"
+	)
+
+	verbose "Unmounting vnode disk..." 2
+	run "${_SUDO}umount ${BUILDDIR}/mnt"
+
+	verbose "Installing boot blocks..." 2
+
+	if [ ! -f ${BUILDDIR}/usr/mdec/bootxx_ffsv2 ]; then
+		run "${_SUDO}tar zxf ${SETSDIR}/base.tar.xz -C ${BUILDDIR} ./usr/mdec/bootxx_ffsv2" "wait"
+	fi
+	run "${_SUDO}installboot -m amd64 -o timeout=5 /dev/r${_DK} ${BUILDDIR}/usr/mdec/bootxx_ffsv2"
+}
+
+usage() {
+	cat <<EOH
+Usage: ${PROGNAME} [-Pfhv] [-b dir] [-d dir] [-i image] [-r release]
+        -P          disable PGP verification of fetched sets
+        -b dir      use this build directory (default: ${BUILDDIR})
+        -d dir      look for install sets in this directory (default: ${SETSDIR})
+                    if no sets are found, fetch sets via HTTPS into ${BUILDDIR}
+        -f          fetch sets even if they are found in ${SETSDIR}
+        -h          print this help and exit
+        -i image    write image to this file (default: ${IMG})
+        -r release  specify release version (default: ${RELEASE})
+                    (only meaningful if sets are being fetched)
+        -v          be verbose
+EOH
+}
+
+run() {
+	local cmd="${1}"
+	local yesno="${2:-}"
+
+	verbose "Running '${cmd}'..." 3 "${yesno}"
+	eval ${cmd}
+	if [ -n "${yesno}" ]; then
+		verbose " done." 3 "" "true"
+	fi
+}
+
+verbose() {
+	local readonly msg="${1}"
+	local level="${2:-1}"
+	local no_eol="${3:-}"
+	local no_level="${4:-}"
+	local i=0
+
+	if [ ${level} -le ${VERBOSITY} ]; then
+		if [ -z "${no_level}" ]; then
+			while [ ${i} -lt ${level} ]; do
+				printf "=" >&2
+				i=$(( ${i} + 1 ))
+			done
+			printf "> " >&2
+		fi
+		printf "${msg}" >&2
+		if [ -z "${no_eol}" ]; then
+			printf "\n" >&2
+		fi
+	fi
+}
+
+###
+### Main
+###
+
+while getopts 'Pb:d:fhi:r:v' opt; do
+	case "${opt}" in
+		P)
+			_VERIFY=""
+		;;
+		b)
+			BUILDDIR="${OPTARG}"
+		;;
+		d)
+			SETSDIR="${OPTARG}"
+		;;
+		f)
+			_FORCE_FETCH="yes"
+		;;
+		h|\?)
+			usage
+			exit 0
+			# NOTREACHED
+		;;
+		i)
+			IMG="${OPTARG}"
+		;;
+		r)
+			RELEASE="${OPTARG}"
+		;;
+		v)
+			VERBOSITY=$(( ${VERBOSITY} + 1 ))
+		;;
+	esac
+done
+
+checkDir
+
+BUILDDIR=$(cd ${BUILDDIR} && pwd)
+
+if [ x"${_FETCH}" = x"yes" -o x"${_FORCE_FETCH}" = x"yes" ]; then
+	fetchFiles
+fi
+
+configureDisk
+installNetBSD
+cleanup
+
+echo "NetBSD/amd64 ${RELEASE} image created."
+du -h ${IMG}
+
+exit 0
